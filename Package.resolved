@@ -1,13 +1,13 @@
 {
-  "originHash" : "13d9ea6feeed299df6aaee39f5fd1b734f3a45c64c413b82bee6357af33fe004",
+  "originHash" : "f1b8dab180bdca74545ec9e6d4ffe8716333b69e6f2ff0482a685fbfdb444c17",
   "pins" : [
     {
-      "identity" : "swift-argument-parser",
+      "identity" : "vovo-core",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/apple/swift-argument-parser",
+      "location" : "https://github.com/franckverrot/vovo-core.git",
       "state" : {
-        "revision" : "6a52f3251125d74daf04fcbd5e6f08a75d074382",
-        "version" : "1.8.2"
+        "branch" : "main",
+        "revision" : "bbb022462f6f1f0eeafff864295c7861a7b9ee57"
       }
     }
   ],
