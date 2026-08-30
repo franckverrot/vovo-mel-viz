@@ -1,6 +1,6 @@
 # vovo-mel-viz
 
-MelViz is a macOS spectogram visualizer that shows the actual `[T, 100]` log-mel a TTS model produces.  It lets you re-runs the vocoder so you can *hear* the edit, and A/Bs it against the original.  It's all live, and can work mid-sentence.  It was built to help debug [Vovo](https://github.com/franckverrot/vovo-core), a TTS voice model made from-scratch in Swift with Metal kernels, as a tool to find out *where* the model didn't perform properly.
+MelViz is a macOS spectrogram visualizer that shows the actual `[T, 100]` log-mel a TTS model produces.  It lets you re-run the vocoder so you can *hear* the edit, and A/Bs it against the original.  It's all live, and can work mid-sentence.  It was built to help debug [Vovo](https://github.com/franckverrot/vovo-core), a TTS voice model made from-scratch in Swift with Metal kernels, as a tool to find out *where* the model didn't perform properly.
 
 ![2-D heatmap](docs/screenshot-2d.png)
 
