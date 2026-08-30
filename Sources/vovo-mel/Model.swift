@@ -1,0 +1,222 @@
+import Foundation
+import MetalKit
+import SceneKit
+import SwiftUI
+import VovoData
+import VovoMetal
+import VovoModel
+import VovoText
+
+/// The editor's state: a source mel, edit parameters, the edited mel, and the vocoded audio for both.
+@MainActor
+final class AppModel: ObservableObject {
+    @Published var sourceName = "—"
+    @Published var frames = 0
+    @Published var original: [Float] = []
+    @Published var edited: [Float] = []
+    @Published var params = EditParams() { didSet { recompute() } }
+    @Published var vocoderName = "vocos"
+    @Published var showOriginal = false { didSet { if live { audio.swap(currentAudio) } } }   // A/B for the view, play and the live loop
+    @Published var live = false { didSet { live ? audio.startLoop(currentAudio) : audio.stopLoop(); if live { status = "live: edits are heard in the loop" } } }
+    @Published var terrain3D = false
+    @Published var status = "load a WAV or synthesize"
+    @Published var lastRenderMs = 0.0
+    @Published var audioOriginal: [Float] = []
+    @Published var audioEdited: [Float] = []
+    @Published var layer = "decoder"          // decoder | prior | wav
+    var synthesis: VovoTTS.Synthesis? = nil
+    @Published var checkpointPath = "checkpoints/lj3/step_6000.safetensors"
+    @Published var vocoderPath = Vocos.defaultCheckpoint?.path ?? "assets/vocos/model.safetensors"
+    @Published var models = ModelScan()
+    let audio = AudioOut()
+    weak var heatmap: MTKView? = nil
+    var heatmapRenderer: MelHeatmap.Renderer? = nil
+    weak var terrain: SCNView? = nil
+    private var vocos: Vocos? = Vocos.defaultCheckpoint.flatMap { try? Vocos(checkpoint: $0) }
+    private let inverter = MelInverter()
+    private var model: (path: String, model: VovoTTS)? = nil
+    private var pendingVocode: DispatchWorkItem? = nil
+    private var lastSay: (text: String, guidance: Float, steps: Int)? = nil
+
+    init() { models = ModelScan.scan() }
+
+    /// Safetensors files under checkpoints/, exports/ and assets/, classified by their keys.
+    struct ModelScan: Codable {
+        struct File: Codable, Identifiable, Hashable { var path: String, step: String; var id: String { path } }
+        var acoustic: [File] = [], vocoders: [File] = []
+
+        static func scan(roots: [String] = ["checkpoints", "exports", "assets"]) -> ModelScan {
+            var out = ModelScan()
+            let fm = FileManager.default
+            for root in roots {
+                guard let e = fm.enumerator(atPath: root) else { continue }
+                for case let rel as String in e where rel.hasSuffix(".safetensors") && rel.split(separator: "/").count <= 3 {
+                    let path = root + "/" + rel
+                    guard let (keys, meta) = header(of: path) else { continue }
+                    let f = File(path: path, step: meta["step"] ?? "")
+                    if keys.contains("encoder.emb.weight") { out.acoustic.append(f) } else if keys.contains("backbone.embed.weight") { out.vocoders.append(f) }
+                }
+            }
+            out.acoustic.sort { $0.path < $1.path }; out.vocoders.sort { $0.path < $1.path }
+            return out
+        }
+
+        /// Reads only the JSON header of a safetensors file: (tensor names, metadata).
+        static func header(of path: String) -> (Set<String>, [String: String])? {
+            guard let h = FileHandle(forReadingAtPath: path) else { return nil }
+            defer { try? h.close() }
+            guard let lenData = try? h.read(upToCount: 8), lenData.count == 8 else { return nil }
+            let n = Int(lenData.withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).littleEndian })
+            guard n > 0, n < 50_000_000, let json = try? h.read(upToCount: n),
+                  let obj = try? JSONSerialization.jsonObject(with: json) as? [String: Any] else { return nil }
+            let meta = obj["__metadata__"] as? [String: String] ?? [:]
+            return (Set(obj.keys.filter { $0 != "__metadata__" }), meta)
+        }
+    }
+
+    func rescanModels() { models = ModelScan.scan() }
+
+    /// Switch the acoustic checkpoint; re-synthesizes the last sentence if there is one.
+    func setCheckpoint(_ path: String) throws {
+        checkpointPath = path
+        if let s = lastSay { try synthesize(text: s.text, ckpt: path, guidance: s.guidance, steps: s.steps) }
+        else { status = "checkpoint: \(URL(fileURLWithPath: path).lastPathComponent)" }
+    }
+
+    /// Switch the vocoder: a Vocos safetensors path, or "griffinlim".
+    func setVocoder(path: String) throws {
+        if path == "griffinlim" { setVocoder("griffinlim"); return }
+        vocos = try Vocos(checkpoint: URL(fileURLWithPath: path))
+        vocoderPath = path
+        setVocoder("vocos")
+        status = "vocoder: \(path)"
+    }
+
+    var stats: MelEdit.Stats { MelEdit.stats(edited.isEmpty ? original : edited) }
+    var currentAudio: [Float] { showOriginal ? audioOriginal : audioEdited }
+
+    func loadWAV(_ path: String) throws {
+        let a = try Audio.load(URL(fileURLWithPath: path), targetRate: 24000)
+        let mel = MelExtractor().logMel(a)
+        setSource(mel, name: URL(fileURLWithPath: path).lastPathComponent, layer: "wav")
+    }
+
+    func synthesize(text: String, ckpt: String? = nil, guidance: Float = 2, steps: Int = 16) throws {
+        let path = ckpt ?? checkpointPath
+        if model?.path != path { model = (path, try VovoTTS.load(from: URL(fileURLWithPath: path)).model) }
+        checkpointPath = path
+        let s = model!.model.synthesize(phones: G2P().encode(text), steps: steps, guidance: guidance)
+        synthesis = s
+        lastSay = (text, guidance, steps)
+        setSource(s.mel, name: "\"\(text.prefix(40))\" (\(URL(fileURLWithPath: path).lastPathComponent), g\(guidance), \(steps) steps)", layer: "decoder")
+    }
+
+    func selectLayer(_ name: String) {
+        guard let s = synthesis else { return }
+        layer = name
+        original = name == "prior" ? s.prior : s.mel
+        recompute()
+    }
+
+    private func setSource(_ mel: [Float], name: String, layer: String) {
+        original = mel; frames = mel.count / 100; sourceName = name; self.layer = layer
+        audioOriginal = vocode(mel)
+        recompute(immediately: true)
+        if live { audio.swap(currentAudio) }
+    }
+
+    func vocode(_ mel: [Float]) -> [Float] {
+        let t = Date()
+        defer { lastRenderMs = Date().timeIntervalSince(t) * 1000 }
+        if vocoderName == "vocos", let v = vocos { return v.synthesize(logMel: mel) }
+        return inverter.synthesize(logMel: mel)
+    }
+
+    func setVocoder(_ name: String) {
+        vocoderName = name
+        if !original.isEmpty { audioOriginal = vocode(original) }
+        recompute(immediately: true)
+    }
+
+    /// Re-apply the remap now; re-vocode after a short debounce (slider drags).
+    func recompute(immediately: Bool = false) {
+        guard !original.isEmpty else { return }
+        edited = MelEdit.apply(params, to: original, frames: frames)
+        pendingVocode?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.audioEdited = self.vocode(self.edited)
+            self.status = String(format: "vocoded in %.0f ms%@", self.lastRenderMs, self.live ? " · live" : "")
+            if self.live, !self.showOriginal { self.audio.swap(self.audioEdited) }
+        }
+        pendingVocode = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + (immediately ? 0 : (live ? 0.1 : 0.25)), execute: work)
+    }
+
+    func play(original: Bool? = nil) {
+        let useOriginal = original ?? showOriginal
+        let a = useOriginal ? audioOriginal : audioEdited
+        guard !a.isEmpty else { return }
+        if live { live = false }
+        audio.play(a)
+        status = useOriginal ? "playing original" : "playing edited"
+    }
+
+    func export(to dir: String) throws -> [String] {
+        let d = URL(fileURLWithPath: dir)
+        try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        var written: [String] = []
+        for (name, mel, wav) in [("original", original, audioOriginal), ("edited", edited, audioEdited)] {
+            let wavURL = d.appendingPathComponent("\(name).wav"); try Audio.writeWAV(wav, rate: 24000, to: wavURL); written.append(wavURL.path)
+            if let img = MelEdit.image(mel, frames: frames), let png = MelEdit.pngData(img) {
+                let u = d.appendingPathComponent("\(name).png"); try png.write(to: u); written.append(u.path)
+            }
+        }
+        let p = d.appendingPathComponent("params.json"); try JSONEncoder().encode(params).write(to: p); written.append(p.path)
+        return written
+    }
+
+    struct State: Codable {
+        var source: String, layer: String, frames: Int, params: EditParams, vocoder: String, vocoderPath: String, showOriginal: Bool, terrain3D: Bool, live: Bool
+        var stats: MelEdit.Stats, playing: Bool, lastRenderMs: Double, status: String, checkpoint: String
+    }
+    var state: State {
+        State(source: sourceName, layer: layer, frames: frames, params: params, vocoder: vocoderName, vocoderPath: vocoderName == "vocos" ? vocoderPath : "griffinlim",
+              showOriginal: showOriginal, terrain3D: terrain3D, live: live,
+              stats: stats, playing: audio.playing || audio.looping, lastRenderMs: lastRenderMs, status: status, checkpoint: checkpointPath)
+    }
+}
+
+extension AppModel {
+    /// PNG of the window: SwiftUI chrome via cacheDisplay, Metal/SceneKit regions rendered offscreen and composited.
+    /// (Screen capture APIs need a TCC grant this machine denies; the app can always render its own content.)
+    func screenshot() -> Data? {
+        guard let win = NSApp.windows.first(where: { $0.isVisible }), let cv = win.contentView, let rootLayer = cv.layer else { return nil }
+        let scale = win.backingScaleFactor
+        // Render the layer tree (SwiftUI text lives in layers that cacheDisplay skips); Metal/SceneKit layers stay black and get composited below.
+        let base = NSImage(size: cv.bounds.size, flipped: true) { rect in
+            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
+            rootLayer.render(in: ctx); return true
+        }
+        let composed = NSImage(size: cv.bounds.size, flipped: false) { [self] rect in
+            base.draw(in: rect)
+            if let v = heatmap, v.window === win, !v.isHidden, let r = heatmapRenderer,
+               let snap = r.snapshot(width: Int(v.bounds.width * scale), height: Int(v.bounds.height * scale)) {
+                NSImage(cgImage: snap, size: v.bounds.size).draw(in: v.convert(v.bounds, to: cv))
+            }
+            if let s = terrain, s.window === win, !s.isHidden { s.snapshot().draw(in: s.convert(s.bounds, to: cv)) }
+            // SwiftUI text is not captured by cacheDisplay/CALayer.render on macOS 26: stamp the state as a caption.
+            let st = stats, p = params
+            let caption = String(format: "%@  ·  layer %@  ·  %d frames  ·  min %.2f max %.2f mean %.2f floor %.0f%%  ·  %@ %@\nexposure %.1f dB  contrast %.2f@%.1f  hi %.2f  sh %.2f  tilt %.1f/%.1f  floor %.0f dB  highCut %d  smooth %.2f  ·  %@",
+                                 sourceName, layer, frames, st.min, st.max, st.mean, st.floorFraction * 100, vocoderName, showOriginal ? "(original)" : "(edited)",
+                                 p.exposure, p.contrast, p.pivot, p.highlights, p.shadows, p.tiltLow, p.tiltHigh, p.floorDB, p.highCut, p.smooth, status)
+            let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedSystemFont(ofSize: 11, weight: .medium), .foregroundColor: NSColor.white]
+            let box = NSRect(x: 0, y: rect.maxY - 36, width: rect.width, height: 36)
+            NSColor(calibratedWhite: 0, alpha: 0.75).setFill(); box.fill()
+            (caption as NSString).draw(in: box.insetBy(dx: 8, dy: 3), withAttributes: attrs)
+            return true
+        }
+        guard let tiff = composed.tiffRepresentation, let bmp = NSBitmapImageRep(data: tiff) else { return nil }
+        return bmp.representation(using: .png, properties: [:])
+    }
+}
