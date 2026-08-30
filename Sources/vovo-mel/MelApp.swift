@@ -41,6 +41,7 @@ struct EditorView: View {
     var body: some View {
         HSplitView {
             VStack(spacing: 8) {
+                if !model.hasAcoustic || !model.hasVocos || model.downloadProgress != nil { weightsBanner }
                 header
                 ZStack {
                     if model.frames == 0 {
@@ -133,6 +134,28 @@ struct EditorView: View {
                 do { try model.synthesize(text: sayText, guidance: guidance, steps: steps) } catch { model.status = "\(error)" }
             }.keyboardShortcut(.return, modifiers: .command)
         }
+    }
+
+    /// Shown until an acoustic checkpoint and a Vocos vocoder are available: one click fetches the published voice.
+    var weightsBanner: some View {
+        HStack(spacing: 12) {
+            Image(systemName: model.downloadProgress != nil ? "arrow.down.circle" : "exclamationmark.triangle")
+            if let p = model.downloadProgress {
+                ProgressView(value: p).frame(width: 220)
+                Text(model.downloadMessage).font(.caption).lineLimit(1)
+            } else {
+                Text(!model.hasAcoustic && !model.hasVocos ? "No weights yet. WAVs work (Griffin-Lim); synthesis needs the published voice."
+                     : !model.hasAcoustic ? "No acoustic checkpoint: synthesis is off until you download the published voice or pick a file."
+                     : "No Vocos vocoder: using Griffin-Lim. Download the published voice for real audio.")
+                    .font(.callout)
+                Button("Download Vovo voice (\(HubWeights.approxMB) MB)") { model.downloadWeights() }.buttonStyle(.borderedProminent)
+                Text("from huggingface.co/\(HubWeights.repo)").font(.caption2).foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(10)
+        .background(Color.accentColor.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     enum ModelKind { case acoustic, vocoder }

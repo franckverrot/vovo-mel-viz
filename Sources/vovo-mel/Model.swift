@@ -25,27 +25,72 @@ final class AppModel: ObservableObject {
     @Published var audioEdited: [Float] = []
     @Published var layer = "decoder"          // decoder | prior | wav
     var synthesis: VovoTTS.Synthesis? = nil
-    @Published var checkpointPath = "checkpoints/lj3/step_6000.safetensors"
-    @Published var vocoderPath = Vocos.defaultCheckpoint?.path ?? "assets/vocos/model.safetensors"
+    @Published var checkpointPath = ""            // empty = no acoustic checkpoint chosen yet
+    @Published var vocoderPath = ""               // empty = no Vocos file (Griffin-Lim fallback)
     @Published var models = ModelScan()
+    @Published var downloadProgress: Double? = nil  // non-nil while the Hub weights are downloading
+    @Published var downloadMessage = ""
     let audio = AudioOut()
     weak var heatmap: MTKView? = nil
     var heatmapRenderer: MelHeatmap.Renderer? = nil
     weak var terrain: SCNView? = nil
-    private var vocos: Vocos? = Vocos.defaultCheckpoint.flatMap { try? Vocos(checkpoint: $0) }
+    private var vocos: Vocos? = nil
     private let inverter = MelInverter()
     private var model: (path: String, model: VovoTTS)? = nil
     private var pendingVocode: DispatchWorkItem? = nil
     private var lastSay: (text: String, guidance: Float, steps: Int)? = nil
 
-    init() { models = ModelScan.scan() }
+    var weightsInstalled: Bool { HubWeights.isInstalled }
+    var hasAcoustic: Bool { !checkpointPath.isEmpty && FileManager.default.fileExists(atPath: checkpointPath) }
+    var hasVocos: Bool { vocos != nil }
 
-    /// Safetensors files under checkpoints/, exports/ and assets/, classified by their keys.
+    init() {
+        models = ModelScan.scan()
+        pickDefaults()
+    }
+
+    /// Choose a checkpoint and a vocoder from what is on disk: the downloaded Hub weights first, then the
+    /// bundled Vocos / anything found under checkpoints/, exports/, assets/. Says clearly when nothing is there.
+    func pickDefaults() {
+        if checkpointPath.isEmpty || !FileManager.default.fileExists(atPath: checkpointPath) {
+            checkpointPath = HubWeights.isInstalled ? HubWeights.modelPath : (models.acoustic.last?.path ?? "")
+        }
+        if vocos == nil {
+            let candidates = [HubWeights.isInstalled ? HubWeights.vocoderPath : nil, Vocos.defaultCheckpoint?.path, models.vocoders.first?.path].compactMap { $0 }
+            for c in candidates { if let v = try? Vocos(checkpoint: URL(fileURLWithPath: c)) { vocos = v; vocoderPath = c; vocoderName = "vocos"; break } }
+            if vocos == nil { vocoderName = "griffinlim" }
+        }
+        if !hasAcoustic && !hasVocos { status = "no weights found — Download the published voice (\(HubWeights.approxMB) MB) or open a WAV" }
+        else if !hasAcoustic { status = "no acoustic checkpoint — Download the published voice or choose one; WAVs work" }
+        else if !hasVocos { status = "no Vocos weights — Download the published voice; using Griffin-Lim" }
+    }
+
+    /// Fetch the published weights from the Hub (async), then select them.
+    func downloadWeights() {
+        guard downloadProgress == nil else { return }
+        downloadProgress = 0; downloadMessage = "starting…"
+        Task { @MainActor in
+            do {
+                try await HubWeights.download { [weak self] frac, msg in self?.downloadProgress = frac; self?.downloadMessage = msg }
+                rescanModels()
+                if let v = try? Vocos(checkpoint: URL(fileURLWithPath: HubWeights.vocoderPath)) { vocos = v; vocoderPath = HubWeights.vocoderPath; vocoderName = "vocos" }
+                checkpointPath = HubWeights.modelPath
+                if !original.isEmpty { audioOriginal = vocode(original); recompute(immediately: true); if live { audio.swap(currentAudio) } }
+                status = "weights installed — ready to synthesize"
+            } catch {
+                status = "download failed: \(error.localizedDescription)"
+                downloadMessage = "failed: \(error.localizedDescription)"
+            }
+            downloadProgress = nil
+        }
+    }
+
+    /// Safetensors files under checkpoints/, exports/, assets/ and the downloaded Hub weights, classified by their keys.
     struct ModelScan: Codable {
         struct File: Codable, Identifiable, Hashable { var path: String, step: String; var id: String { path } }
         var acoustic: [File] = [], vocoders: [File] = []
 
-        static func scan(roots: [String] = ["checkpoints", "exports", "assets"]) -> ModelScan {
+        static func scan(roots: [String] = ["checkpoints", "exports", "assets", HubWeights.directory.path]) -> ModelScan {
             var out = ModelScan()
             let fm = FileManager.default
             for root in roots {
@@ -77,7 +122,13 @@ final class AppModel: ObservableObject {
     func rescanModels() { models = ModelScan.scan() }
 
     /// Switch the acoustic checkpoint; re-synthesizes the last sentence if there is one.
+    struct FileMissing: LocalizedError { var path: String; var errorDescription: String? { "no such file: \(path)" } }
+
     func setCheckpoint(_ path: String) throws {
+        guard FileManager.default.fileExists(atPath: path), ModelScan.header(of: path)?.0.contains("encoder.emb.weight") == true else {
+            if !FileManager.default.fileExists(atPath: path) { throw FileMissing(path: path) }
+            throw NSError(domain: "vovo-mel", code: 2, userInfo: [NSLocalizedDescriptionKey: "not a Vovo acoustic checkpoint: \(path)"])
+        }
         checkpointPath = path
         if let s = lastSay { try synthesize(text: s.text, ckpt: path, guidance: s.guidance, steps: s.steps) }
         else { status = "checkpoint: \(URL(fileURLWithPath: path).lastPathComponent)" }
@@ -101,8 +152,11 @@ final class AppModel: ObservableObject {
         setSource(mel, name: URL(fileURLWithPath: path).lastPathComponent, layer: "wav")
     }
 
+    struct NoWeights: LocalizedError { var errorDescription: String? { "no acoustic checkpoint — Download the published voice (\(HubWeights.approxMB) MB) or choose a safetensors file" } }
+
     func synthesize(text: String, ckpt: String? = nil, guidance: Float = 2, steps: Int = 16) throws {
         let path = ckpt ?? checkpointPath
+        guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else { status = NoWeights().errorDescription!; throw NoWeights() }
         if model?.path != path { model = (path, try VovoTTS.load(from: URL(fileURLWithPath: path)).model) }
         checkpointPath = path
         let s = model!.model.synthesize(phones: G2P().encode(text), steps: steps, guidance: guidance)
@@ -179,11 +233,15 @@ final class AppModel: ObservableObject {
     struct State: Codable {
         var source: String, layer: String, frames: Int, params: EditParams, vocoder: String, vocoderPath: String, showOriginal: Bool, terrain3D: Bool, live: Bool
         var stats: MelEdit.Stats, playing: Bool, lastRenderMs: Double, status: String, checkpoint: String
+        var weights: Weights
+        struct Weights: Codable { var installed: Bool, directory: String, repo: String, hasAcoustic: Bool, hasVocos: Bool, downloading: Double?, message: String }
     }
     var state: State {
         State(source: sourceName, layer: layer, frames: frames, params: params, vocoder: vocoderName, vocoderPath: vocoderName == "vocos" ? vocoderPath : "griffinlim",
               showOriginal: showOriginal, terrain3D: terrain3D, live: live,
-              stats: stats, playing: audio.playing || audio.looping, lastRenderMs: lastRenderMs, status: status, checkpoint: checkpointPath)
+              stats: stats, playing: audio.playing || audio.looping, lastRenderMs: lastRenderMs, status: status, checkpoint: checkpointPath,
+              weights: .init(installed: weightsInstalled, directory: HubWeights.directory.path, repo: HubWeights.repo, hasAcoustic: hasAcoustic, hasVocos: hasVocos,
+                             downloading: downloadProgress, message: downloadMessage))
     }
 }
 

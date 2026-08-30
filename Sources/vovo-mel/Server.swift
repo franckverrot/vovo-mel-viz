@@ -11,7 +11,8 @@ import VovoData
 ///   POST /params   {"exposure":..,"contrast":..,...}   (partial: only given keys change)
 ///   POST /load     {"wav":"path"} | {"say":"text","ckpt":"path","guidance":2,"steps":16} | {"layer":"prior|decoder"}
 ///   GET  /models             -> {"acoustic":[{path,step}…],"vocoders":[…]} (safetensors found under checkpoints/, exports/, assets/)
-///   POST /models   {"ckpt":"path","vocoder":"path|griffinlim","rescan":true}   (switching the checkpoint re-synthesizes the last sentence)
+///   POST /models   {"ckpt":"path","vocoder":"path|griffinlim","rescan":true,"download":true}
+///                  (switching the checkpoint re-synthesizes the last sentence; download = fetch the published weights from the Hub, async — poll /state)
 ///   POST /vocoder  {"name":"vocos|griffinlim"} | {"path":"….safetensors"}
 ///   POST /play     {"which":"edited|original"} ; POST /stop
 ///   POST /view     {"showOriginal":bool,"terrain3D":bool,"live":bool}   (live = loop the utterance, hot-swap on every edit)
@@ -133,6 +134,7 @@ final class LocalServer {
             case ("POST", "/models"):
                 let b = body(req)
                 if b["rescan"] as? Bool == true { model.rescanModels() }
+                if b["download"] as? Bool == true { model.downloadWeights() }   // async; poll /state → weights.downloading
                 if let v = b["vocoder"] as? String { try model.setVocoder(path: v) }
                 if let c = b["ckpt"] as? String { try model.setCheckpoint(c) }
                 return ("200 OK", "application/json", try JSONEncoder().encode(model.state))
@@ -154,7 +156,7 @@ final class LocalServer {
                 return ("404 Not Found", "text/plain", Data("unknown route \(req.method) \(req.path)".utf8))
             }
         } catch {
-            return ("500 Internal Server Error", "application/json", json(["error": "\(error)"]))
+            return ("500 Internal Server Error", "application/json", json(["error": (error as? LocalizedError)?.errorDescription ?? error.localizedDescription]))
         }
     }
 }

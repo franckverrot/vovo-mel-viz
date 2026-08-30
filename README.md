@@ -44,6 +44,16 @@ cd .. && ./vovo-mel-viz/.build/release/vovo-mel        # run from the Vovo root 
 `VOVO_MEL_WAV=path.wav` preloads a file; `VOVO_MEL_PORT` changes the API port. Requires macOS 15+ on Apple
 silicon. It never trains and never writes checkpoints — it only loads them.
 
+### First launch: the weights
+
+The app ships without weights. On first launch it says so and offers **Download Vovo voice (135 MB)**: one
+click fetches the published acoustic model and vocoder from
+[`franckverrot/vovo`](https://huggingface.co/franckverrot/vovo) (plain HTTPS, no account) into
+`~/Library/Application Support/vovo-mel-viz/weights/` and selects them. Until then, WAVs still load and edit
+(vocoded with Griffin-Lim). Any other `.safetensors` found under `checkpoints/`, `exports/` or `assets/` of
+the current directory shows up in the Model / Vocoder menus, and `…` browses for one anywhere.
+The same over the API: `POST /models {"download": true}`, then poll `GET /state` → `weights`.
+
 ## Remaps (the develop panel)
 
 All remaps are per-cell functions of the log value `v` (log-mel, floor `log(1e-7)`), band index `b` and
