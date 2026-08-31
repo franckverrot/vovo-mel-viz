@@ -33,6 +33,11 @@ final class AppModel: ObservableObject {
     @Published var showPhones = true
     @Published var playhead: Double = 0
     /// Prosody knobs for the next synthesis (variance-adaptor models).
+    /// Hand-drawn pitch: one semitone offset per phone, edited by dragging the contour.
+    @Published var pitchDelta: [Float] = []
+    @Published var editingPitch = false
+    /// Per-phone F0 in Hz as predicted before any hand editing (the curve you drag away from).
+    @Published var baseHz: [Float] = []
     @Published var pitchShift: Float = 0
     @Published var pitchScale: Float = 1
     @Published var energyShift: Float = 0
@@ -48,6 +53,9 @@ final class AppModel: ObservableObject {
     private var pendingVocode: DispatchWorkItem? = nil
     private var lastSay: (text: String, guidance: Float, steps: Int)? = nil
     private var lastPhones: [String] = []
+    private var lastNoise: [Float] = []
+    private var pendingResynth: DispatchWorkItem? = nil
+    private var lastPlan: [VovoTTS.PhoneControl]? = nil
 
     var weightsInstalled: Bool { HubWeights.isInstalled }
     var hasAcoustic: Bool { !checkpointPath.isEmpty && FileManager.default.fileExists(atPath: checkpointPath) }
@@ -163,6 +171,79 @@ final class AppModel: ObservableObject {
 
     struct NoWeights: LocalizedError { var errorDescription: String? { "no acoustic checkpoint — Download the published voice (\(HubWeights.approxMB) MB) or choose a safetensors file" } }
 
+    /// Normalized log-F0 (what the model predicts) -> Hz, using this speaker's statistics.
+    func hzFromNormalized(_ values: [Float]) -> [Float] {
+        guard let cfg = model?.model.cfg, !cfg.f0Mean.isEmpty else { return values.map { _ in 0 } }
+        let mean = cfg.f0Mean[0], std = Swift.max(cfg.f0Std[0], 1e-3)
+        return values.map { exp(mean + $0 * std) }
+    }
+
+    /// The curve as edited: the prediction times the hand-drawn semitone offsets.
+    var editedHz: [Float] {
+        zip(baseHz, pitchDelta.isEmpty ? [Float](repeating: 0, count: baseHz.count) : pitchDelta).map { $0 * pow(2, $1 / 12) }
+    }
+
+    /// Drag one phone's pitch to `hz` (and blend it into `radius` neighbours so the line stays smooth).
+    func setPitch(phone: Int, hz: Float, radius: Int = 1) {
+        guard phone >= 0, phone < baseHz.count, baseHz[phone] > 0, hz > 20 else { return }
+        let target = 12 * log2(hz / baseHz[phone])
+        for r in -radius...radius {
+            let i = phone + r
+            guard i >= 0, i < pitchDelta.count else { continue }
+            let weight = Float(1) / Float(abs(r) + 1)
+            pitchDelta[i] += (target - pitchDelta[i]) * weight
+        }
+        scheduleResynth()
+    }
+
+    /// Move the playhead by hand, and follow it with the audio when something is playing.
+    func scrub(to seconds: Double) {
+        playhead = max(0, seconds)
+        if audio.playing || audio.looping { audio.seek(playhead, in: currentAudio) }
+    }
+
+    func resetPitchCurve() {
+        guard !pitchDelta.isEmpty else { return }
+        pitchDelta = [Float](repeating: 0, count: pitchDelta.count)
+        scheduleResynth()
+    }
+
+    /// Re-synthesize from the same noise so only the prosody you dragged changes, then re-vocode.
+    func scheduleResynth(immediately: Bool = false) {
+        pendingResynth?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.resynthesize() }
+        pendingResynth = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + (immediately ? 0 : 0.12), execute: work)
+    }
+
+    private func resynthesize() {
+        guard let m = model?.model, let last = lastSay, !pitchDelta.isEmpty else { return }
+        let g2p = G2P()
+        let ids: [Int32]
+        var control: [VovoTTS.PhoneControl]
+        if let plan = lastPlan {
+            ids = (try? VovoTTS.plan(ssml: last.text, g2p: g2p).phones) ?? []
+            control = plan
+        } else {
+            ids = g2p.encode(last.text)
+            control = ids.map { _ in VovoTTS.PhoneControl() }
+        }
+        guard ids.count == pitchDelta.count else { return }
+        for i in 0..<control.count { control[i].pitchShift += pitchDelta[i] }
+        let t0 = Date()
+        let s = m.synthesize(phones: ids, steps: last.steps, guidance: last.guidance,
+                             noise: lastNoise.count == 0 ? nil : lastNoise,
+                             pitchShift: pitchShift, pitchScale: pitchScale, energyShift: energyShift, control: control)
+        synthesis = s
+        original = layer == "prior" ? s.prior : s.mel
+        frames = original.count / 100
+        audioOriginal = vocode(original)
+        recompute(immediately: true)
+        rebuildTimeline()
+        if live { audio.swap(currentAudio) }
+        status = String(format: "re-synthesized in %.0f ms", Date().timeIntervalSince(t0) * 1000)
+    }
+
     /// Pitch contour of whatever is currently playing, plus the phone spans when we synthesized it.
     func rebuildTimeline() {
         var t = Timeline()
@@ -190,9 +271,15 @@ final class AppModel: ObservableObject {
             plan = nil; tokens = g2p.phonemize(text)
         }
         lastPhones = plan == nil ? tokens : PhoneSet.decode(plan!.phones).map(String.init)
-        let s = model!.model.synthesize(phones: plan?.phones ?? PhoneSet.encode(tokens), steps: steps, guidance: guidance,
+        let ids = plan?.phones ?? PhoneSet.encode(tokens)
+        let s = model!.model.synthesize(phones: ids, steps: steps, guidance: guidance,
                                         pitchShift: pitchShift, pitchScale: pitchScale, energyShift: energyShift,
                                         control: plan?.control)
+        // Fresh sentence: reset the hand-drawn curve and remember the noise, so later edits move only pitch.
+        lastNoise = s.x0
+        pitchDelta = [Float](repeating: 0, count: s.pitch.count)
+        baseHz = hzFromNormalized(s.pitch)
+        lastPlan = plan?.control
         synthesis = s
         lastSay = (text, guidance, steps)
         setSource(s.mel, name: "\"\(text.prefix(40))\" (\(URL(fileURLWithPath: path).lastPathComponent), g\(guidance), \(steps) steps)", layer: "decoder")
@@ -323,6 +410,19 @@ extension AppModel {
                 let label = phone.symbol == " " ? "·" : phone.symbol
                 (label as NSString).draw(at: CGPoint(x: x(Double(phone.start)) + 1, y: rect.minY + 2), withAttributes: attrs)
             }
+            ctx.restoreGState()
+        }
+        if editingPitch, !baseHz.isEmpty, !timeline.phones.isEmpty {
+            let hz = editedHz
+            ctx.saveGState()
+            ctx.setStrokeColor(NSColor.cyan.cgColor); ctx.setLineWidth(2.5); ctx.setLineCap(.round)
+            for (i, phone) in timeline.phones.enumerated() where i < hz.count {
+                guard let f = Timeline.melFraction(hz: hz[i]) else { continue }
+                let y = rect.minY + rect.height * f
+                ctx.move(to: CGPoint(x: x(Double(phone.start)), y: y))
+                ctx.addLine(to: CGPoint(x: x(Double(phone.start + phone.length)), y: y))
+            }
+            ctx.strokePath()
             ctx.restoreGState()
         }
         if playhead > 0 {

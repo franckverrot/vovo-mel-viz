@@ -55,6 +55,7 @@ struct EditorView: View {
                         MelHeatmap(mel: model.showOriginal ? model.original : model.edited, frames: model.frames)
                         TimelineOverlay(timeline: model.timeline, playhead: model.playhead,
                                         showF0: model.showF0, showPhones: model.showPhones)
+                        TimelineEditor()
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -69,6 +70,11 @@ struct EditorView: View {
                     return true
                 }
                 transport
+                TextField("Text to synthesize — plain text or SSML (<prosody>, <emphasis>, <break/>)", text: $sayText, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 13))
+                    .lineLimit(2...5)
+                    .onSubmit { say() }
                 synthBar
             }
             .padding(12)
@@ -76,7 +82,9 @@ struct EditorView: View {
             controls.frame(width: 320)
         }
         .onReceive(tick) { _ in
-            let p = model.audio.playing || model.audio.looping ? model.audio.playhead : 0
+            // Follow the audio while it plays; leave a hand-placed playhead alone when it stops.
+            guard model.audio.playing || model.audio.looping else { return }
+            let p = model.audio.playhead
             if abs(p - model.playhead) > 0.001 { model.playhead = p }
         }
     }
@@ -91,6 +99,9 @@ struct EditorView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
+            Toggle("✎ Pitch", isOn: $model.editingPitch).toggleStyle(.button)
+                .help("Drag the cyan line to reshape the pitch, phone by phone; it re-synthesizes from the same noise")
+            Button("Reset curve") { model.resetPitchCurve() }.disabled(model.pitchDelta.allSatisfy { $0 == 0 })
             Toggle("F0", isOn: $model.showF0).toggleStyle(.button).help("Draw the pitch contour where its frequency lands on the mel scale")
             Toggle("Phones", isOn: $model.showPhones).toggleStyle(.button).help("Phone boundaries and labels (synthesized audio only)")
             Picker("", selection: $model.terrain3D) { Text("2-D").tag(false); Text("3-D").tag(true) }.pickerStyle(.segmented).frame(width: 120)
@@ -131,7 +142,6 @@ struct EditorView: View {
                 let p = NSOpenPanel(); p.allowedContentTypes = [.wav, .audio]
                 if p.runModal() == .OK, let u = p.url { try? model.loadWAV(u.path) }
             }.keyboardShortcut("o")
-            TextField("Text to synthesize", text: $sayText).textFieldStyle(.roundedBorder)
             Picker("Model", selection: Binding(get: { model.checkpointPath }, set: { v in do { try model.setCheckpoint(v) } catch { model.status = "\(error)" } })) {
                 ForEach(model.models.acoustic) { f in Text(label(f)).tag(f.path) }
                 if !model.models.acoustic.contains(where: { $0.path == model.checkpointPath }) { Text(label(model.checkpointPath)).tag(model.checkpointPath) }
@@ -143,10 +153,7 @@ struct EditorView: View {
             Stepper("pitch \(String(format: "%+.0f", model.pitchShift)) st", value: $model.pitchShift, in: -12...12, step: 1).frame(width: 105)
             Stepper("range ×\(String(format: "%.1f", model.pitchScale))", value: $model.pitchScale, in: 0...2, step: 0.25).frame(width: 105)
             Stepper("vol \(String(format: "%+.0f", model.energyShift)) dB", value: $model.energyShift, in: -12...12, step: 1).frame(width: 100)
-            Button("Say") {
-                model.status = "synthesizing…"
-                do { try model.synthesize(text: sayText, guidance: guidance, steps: steps) } catch { model.status = "\(error)" }
-            }.keyboardShortcut(.return, modifiers: .command)
+            Button("Say") { say() }.keyboardShortcut(.return, modifiers: .command).buttonStyle(.borderedProminent)
         }
     }
 
@@ -170,6 +177,11 @@ struct EditorView: View {
         .padding(10)
         .background(Color.accentColor.opacity(0.12))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    func say() {
+        model.status = "synthesizing…"
+        do { try model.synthesize(text: sayText, guidance: guidance, steps: steps) } catch { model.status = "\(error)" }
     }
 
     enum ModelKind { case acoustic, vocoder }

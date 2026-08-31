@@ -16,6 +16,8 @@ import VovoData
 ///   POST /vocoder  {"name":"vocos|griffinlim"} | {"path":"….safetensors"}
 ///   POST /play     {"which":"edited|original"} ; POST /stop
 ///   POST /view     {"showOriginal":bool,"terrain3D":bool,"live":bool}   (live = loop the utterance, hot-swap on every edit)
+///   GET  /pitch              -> per-phone base/edited F0 in Hz, the hand-drawn deltas, and the phone spans
+///   POST /pitch    {"phone":N,"hz":180,"radius":1} | {"reset":true} | {"scrub":seconds} | {"editing":bool}
 ///   POST /export   {"dir":"path"} -> {"written":[…]}
 final class LocalServer {
     let model: AppModel
@@ -143,6 +145,20 @@ final class LocalServer {
                 return ("200 OK", "application/json", json(["playing": true]))
             case ("POST", "/stop"):
                 model.audio.stop(); if model.live { model.live = false }; return ("200 OK", "application/json", json(["playing": false]))
+            case ("POST", "/pitch"):
+                let b = body(req)
+                if b["reset"] as? Bool == true { model.resetPitchCurve() }
+                if let phone = (b["phone"] as? NSNumber)?.intValue, let hz = (b["hz"] as? NSNumber)?.floatValue {
+                    model.setPitch(phone: phone, hz: hz, radius: (b["radius"] as? NSNumber)?.intValue ?? 1)
+                }
+                if let t = (b["scrub"] as? NSNumber)?.doubleValue { model.scrub(to: t) }
+                if let e = b["editing"] as? Bool { model.editingPitch = e }
+                return ("200 OK", "application/json", try JSONEncoder().encode(model.state))
+            case ("GET", "/pitch"):
+                return ("200 OK", "application/json", json(["baseHz": model.baseHz.map(Double.init),
+                                                            "editedHz": model.editedHz.map(Double.init),
+                                                            "delta": model.pitchDelta.map(Double.init),
+                                                            "phones": model.timeline.phones.map { ["symbol": $0.symbol, "start": $0.start, "length": $0.length] }]))
             case ("POST", "/view"):
                 let b = body(req)
                 if let v = b["showOriginal"] as? Bool { model.showOriginal = v }

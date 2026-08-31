@@ -101,3 +101,62 @@ struct TimelineOverlay: View {
         return playhead > 0 && t >= phone.start && t < phone.start + phone.length
     }
 }
+
+
+/// The interactive layer: drag to scrub, or (in pitch mode) drag the per-phone contour and hear the edit.
+/// Editing writes semitone offsets into the same per-phone control array that SSML fills in, so the two are
+/// the same feature reached two ways.
+struct TimelineEditor: View {
+    @EnvironmentObject var model: AppModel
+    let frameRate: Double = 93.75
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width, h = geo.size.height
+            let frames = max(model.frames, 1)
+            let ribbon: CGFloat = model.showPhones && !model.timeline.phones.isEmpty ? 22 : 0
+            let melHeight = h - ribbon
+
+            ZStack(alignment: .topLeading) {
+                Color.clear.contentShape(Rectangle())
+
+                // The editable curve: one step per phone, at the pitch the model will be told to use.
+                if model.editingPitch, !model.baseHz.isEmpty, !model.timeline.phones.isEmpty {
+                    let hz = model.editedHz
+                    Path { p in
+                        for (i, phone) in model.timeline.phones.enumerated() where i < hz.count {
+                            guard let f = Timeline.melFraction(hz: hz[i]) else { continue }
+                            let x0 = w * Double(phone.start) / Double(frames)
+                            let x1 = w * Double(phone.start + phone.length) / Double(frames)
+                            let y = melHeight * (1 - f)
+                            p.move(to: CGPoint(x: x0, y: y)); p.addLine(to: CGPoint(x: x1, y: y))
+                        }
+                    }
+                    .stroke(Color.cyan, style: StrokeStyle(lineWidth: 2.5, lineCap: .round))
+                    .shadow(color: .black.opacity(0.7), radius: 1)
+                }
+            }
+            .gesture(DragGesture(minimumDistance: 0).onChanged { g in
+                let frame = Double(frames) * min(max(g.location.x / w, 0), 1)
+                if model.editingPitch, !model.baseHz.isEmpty {
+                    guard let phone = model.timeline.phones.firstIndex(where: { frame >= Double($0.start) && frame < Double($0.start + $0.length) }) else { return }
+                    // y -> mel fraction -> Hz, the inverse of how the contour is drawn.
+                    let fraction = 1 - min(max(g.location.y / melHeight, 0), 1)
+                    model.setPitch(phone: phone, hz: Timeline.hz(melFraction: fraction))
+                } else {
+                    model.scrub(to: frame / frameRate)
+                }
+            })
+        }
+    }
+}
+
+extension Timeline {
+    /// Inverse of `melFraction`: where a point on the band axis sits in Hz.
+    static func hz(melFraction v: Double, cfg: MelConfig = MelConfig()) -> Float {
+        func mel(_ f: Float) -> Double { 2595 * log10(1 + Double(f) / 700) }
+        let lo = mel(cfg.fMin), hi = mel(cfg.fMax)
+        let m = lo + (hi - lo) * min(max(v, 0), 1)
+        return Float(700 * (pow(10, m / 2595) - 1))
+    }
+}

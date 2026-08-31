@@ -77,6 +77,22 @@ final class AudioOut {
 
     func stop() { player.stop(); playing = false; oneShotStart = nil }
 
+    /// Move playback to `seconds`: the loop jumps (crossfaded by the next swap), a one-shot restarts there.
+    func seek(_ seconds: Double, in samples: [Float]) {
+        if looping {
+            os_unfair_lock_lock(lock)
+            pos = min(max(0, Int(seconds * 24000)), max(loopBuf.count - 1, 0))
+            fade = 0
+            os_unfair_lock_unlock(lock)
+            return
+        }
+        guard playing else { return }
+        let from = min(max(0, Int(seconds * 24000)), samples.count)
+        play(Array(samples[from...]))
+        oneShotStart = Date().addingTimeInterval(-seconds)
+        oneShotSeconds = Double(samples.count) / 24000
+    }
+
     /// Start looping `samples` from the beginning (stops one-shot playback).
     func startLoop(_ samples: [Float]) {
         stop()
