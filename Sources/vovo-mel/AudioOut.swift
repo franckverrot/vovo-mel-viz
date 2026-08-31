@@ -11,6 +11,17 @@ final class AudioOut {
     private var source: AVAudioSourceNode!
     private let format = AVAudioFormat(standardFormatWithSampleRate: 24000, channels: 1)!
     private(set) var playing = false
+    /// Where playback currently is, in seconds (loop position, or elapsed time for a one-shot take).
+    var playhead: Double {
+        if looping {
+            os_unfair_lock_lock(lock); defer { os_unfair_lock_unlock(lock) }
+            return Double(pos) / 24000
+        }
+        guard playing, let start = oneShotStart else { return 0 }
+        return min(Date().timeIntervalSince(start), oneShotSeconds)
+    }
+    private var oneShotStart: Date? = nil
+    private var oneShotSeconds: Double = 0
     private(set) var looping = false
 
     // Loop state, guarded by `lock` (touched from the audio thread and the main thread).
@@ -59,11 +70,12 @@ final class AudioOut {
         samples.withUnsafeBufferPointer { buf.floatChannelData![0].update(from: $0.baseAddress!, count: samples.count) }
         if !engine.isRunning { try? engine.start() }
         playing = true
-        player.scheduleBuffer(buf, at: nil, options: []) { [weak self] in DispatchQueue.main.async { self?.playing = false } }
+        oneShotStart = Date(); oneShotSeconds = Double(samples.count) / 24000
+        player.scheduleBuffer(buf, at: nil, options: []) { [weak self] in DispatchQueue.main.async { self?.playing = false; self?.oneShotStart = nil } }
         player.play()
     }
 
-    func stop() { player.stop(); playing = false }
+    func stop() { player.stop(); playing = false; oneShotStart = nil }
 
     /// Start looping `samples` from the beginning (stops one-shot playback).
     func startLoop(_ samples: [Float]) {

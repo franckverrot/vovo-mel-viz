@@ -38,6 +38,9 @@ struct EditorView: View {
     @State private var guidance: Float = 2
     @State private var steps = 16
 
+    /// Drives the playhead while audio is playing; idle otherwise.
+    private let tick = Timer.publish(every: 1.0 / 30, on: .main, in: .common).autoconnect()
+
     var body: some View {
         HSplitView {
             VStack(spacing: 8) {
@@ -50,6 +53,8 @@ struct EditorView: View {
                         MelTerrain(mel: model.showOriginal ? model.original : model.edited, frames: model.frames)
                     } else {
                         MelHeatmap(mel: model.showOriginal ? model.original : model.edited, frames: model.frames)
+                        TimelineOverlay(timeline: model.timeline, playhead: model.playhead,
+                                        showF0: model.showF0, showPhones: model.showPhones)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -70,6 +75,10 @@ struct EditorView: View {
             .frame(minWidth: 700)
             controls.frame(width: 320)
         }
+        .onReceive(tick) { _ in
+            let p = model.audio.playing || model.audio.looping ? model.audio.playhead : 0
+            if abs(p - model.playhead) > 0.001 { model.playhead = p }
+        }
     }
 
     var header: some View {
@@ -82,6 +91,8 @@ struct EditorView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             Spacer()
+            Toggle("F0", isOn: $model.showF0).toggleStyle(.button).help("Draw the pitch contour where its frequency lands on the mel scale")
+            Toggle("Phones", isOn: $model.showPhones).toggleStyle(.button).help("Phone boundaries and labels (synthesized audio only)")
             Picker("", selection: $model.terrain3D) { Text("2-D").tag(false); Text("3-D").tag(true) }.pickerStyle(.segmented).frame(width: 120)
         }
     }
@@ -129,6 +140,9 @@ struct EditorView: View {
             Button("⟳") { model.rescanModels() }.help("Rescan checkpoints/, exports/ and assets/ for safetensors files")
             Stepper("g \(String(format: "%.1f", guidance))", value: $guidance, in: 1...4, step: 0.5).frame(width: 90)
             Stepper("\(steps) steps", value: $steps, in: 2...64, step: 2).frame(width: 100)
+            Stepper("pitch \(String(format: "%+.0f", model.pitchShift)) st", value: $model.pitchShift, in: -12...12, step: 1).frame(width: 105)
+            Stepper("range ×\(String(format: "%.1f", model.pitchScale))", value: $model.pitchScale, in: 0...2, step: 0.25).frame(width: 105)
+            Stepper("vol \(String(format: "%+.0f", model.energyShift)) dB", value: $model.energyShift, in: -12...12, step: 1).frame(width: 100)
             Button("Say") {
                 model.status = "synthesizing…"
                 do { try model.synthesize(text: sayText, guidance: guidance, steps: steps) } catch { model.status = "\(error)" }

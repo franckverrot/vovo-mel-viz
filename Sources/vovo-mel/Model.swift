@@ -28,6 +28,14 @@ final class AppModel: ObservableObject {
     @Published var checkpointPath = ""            // empty = no acoustic checkpoint chosen yet
     @Published var vocoderPath = ""               // empty = no Vocos file (Griffin-Lim fallback)
     @Published var models = ModelScan()
+    @Published var timeline = Timeline()
+    @Published var showF0 = true
+    @Published var showPhones = true
+    @Published var playhead: Double = 0
+    /// Prosody knobs for the next synthesis (variance-adaptor models).
+    @Published var pitchShift: Float = 0
+    @Published var pitchScale: Float = 1
+    @Published var energyShift: Float = 0
     @Published var downloadProgress: Double? = nil  // non-nil while the Hub weights are downloading
     @Published var downloadMessage = ""
     let audio = AudioOut()
@@ -39,6 +47,7 @@ final class AppModel: ObservableObject {
     private var model: (path: String, model: VovoTTS)? = nil
     private var pendingVocode: DispatchWorkItem? = nil
     private var lastSay: (text: String, guidance: Float, steps: Int)? = nil
+    private var lastPhones: [String] = []
 
     var weightsInstalled: Bool { HubWeights.isInstalled }
     var hasAcoustic: Bool { !checkpointPath.isEmpty && FileManager.default.fileExists(atPath: checkpointPath) }
@@ -154,12 +163,36 @@ final class AppModel: ObservableObject {
 
     struct NoWeights: LocalizedError { var errorDescription: String? { "no acoustic checkpoint — Download the published voice (\(HubWeights.approxMB) MB) or choose a safetensors file" } }
 
+    /// Pitch contour of whatever is currently playing, plus the phone spans when we synthesized it.
+    func rebuildTimeline() {
+        var t = Timeline()
+        t.frames = frames
+        let audio = currentAudio
+        if !audio.isEmpty { t.f0 = PitchTracker().f0(audio) }
+        if let s = synthesis, layer != "wav", !lastPhones.isEmpty {
+            t.phones = Timeline.phones(tokens: lastPhones, durations: s.durations)
+        }
+        timeline = t
+    }
+
     func synthesize(text: String, ckpt: String? = nil, guidance: Float = 2, steps: Int = 16) throws {
         let path = ckpt ?? checkpointPath
         guard !path.isEmpty, FileManager.default.fileExists(atPath: path) else { status = NoWeights().errorDescription!; throw NoWeights() }
         if model?.path != path { model = (path, try VovoTTS.load(from: URL(fileURLWithPath: path)).model) }
         checkpointPath = path
-        let s = model!.model.synthesize(phones: G2P().encode(text), steps: steps, guidance: guidance)
+        let g2p = G2P()
+        let tokens: [String]
+        let plan: (phones: [Int32], control: [VovoTTS.PhoneControl], spans: [SSML.Span])?
+        if SSML.looksLikeMarkup(text) {
+            let p = try VovoTTS.plan(ssml: text, g2p: g2p)
+            plan = p; tokens = PhoneSet.decode(p.phones).map(String.init)
+        } else {
+            plan = nil; tokens = g2p.phonemize(text)
+        }
+        lastPhones = plan == nil ? tokens : PhoneSet.decode(plan!.phones).map(String.init)
+        let s = model!.model.synthesize(phones: plan?.phones ?? PhoneSet.encode(tokens), steps: steps, guidance: guidance,
+                                        pitchShift: pitchShift, pitchScale: pitchScale, energyShift: energyShift,
+                                        control: plan?.control)
         synthesis = s
         lastSay = (text, guidance, steps)
         setSource(s.mel, name: "\"\(text.prefix(40))\" (\(URL(fileURLWithPath: path).lastPathComponent), g\(guidance), \(steps) steps)", layer: "decoder")
@@ -175,7 +208,9 @@ final class AppModel: ObservableObject {
     private func setSource(_ mel: [Float], name: String, layer: String) {
         original = mel; frames = mel.count / 100; sourceName = name; self.layer = layer
         audioOriginal = vocode(mel)
+        if layer == "wav" { lastPhones = [] }
         recompute(immediately: true)
+        rebuildTimeline()
         if live { audio.swap(currentAudio) }
     }
 
@@ -200,6 +235,7 @@ final class AppModel: ObservableObject {
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.audioEdited = self.vocode(self.edited)
+            self.rebuildTimeline()
             self.status = String(format: "vocoded in %.0f ms%@", self.lastRenderMs, self.live ? " · live" : "")
             if self.live, !self.showOriginal { self.audio.swap(self.audioEdited) }
         }
@@ -233,6 +269,8 @@ final class AppModel: ObservableObject {
     struct State: Codable {
         var source: String, layer: String, frames: Int, params: EditParams, vocoder: String, vocoderPath: String, showOriginal: Bool, terrain3D: Bool, live: Bool
         var stats: MelEdit.Stats, playing: Bool, lastRenderMs: Double, status: String, checkpoint: String
+        var phones: String, voicedFraction: Double, medianF0: Double, playhead: Double
+        var pitchShift: Float, pitchScale: Float, energyShift: Float
         var weights: Weights
         struct Weights: Codable { var installed: Bool, directory: String, repo: String, hasAcoustic: Bool, hasVocos: Bool, downloading: Double?, message: String }
     }
@@ -240,12 +278,63 @@ final class AppModel: ObservableObject {
         State(source: sourceName, layer: layer, frames: frames, params: params, vocoder: vocoderName, vocoderPath: vocoderName == "vocos" ? vocoderPath : "griffinlim",
               showOriginal: showOriginal, terrain3D: terrain3D, live: live,
               stats: stats, playing: audio.playing || audio.looping, lastRenderMs: lastRenderMs, status: status, checkpoint: checkpointPath,
+              phones: lastPhones.joined(), voicedFraction: timeline.f0.isEmpty ? 0 : Double(timeline.f0.filter { $0 > 0 }.count) / Double(timeline.f0.count),
+              medianF0: {
+                  let v = timeline.f0.filter { $0 > 0 }.sorted()
+                  return v.isEmpty ? 0 : Double(v[v.count / 2])
+              }(),
+              playhead: playhead, pitchShift: pitchShift, pitchScale: pitchScale, energyShift: energyShift,
               weights: .init(installed: weightsInstalled, directory: HubWeights.directory.path, repo: HubWeights.repo, hasAcoustic: hasAcoustic, hasVocos: hasVocos,
                              downloading: downloadProgress, message: downloadMessage))
     }
 }
 
 extension AppModel {
+    /// The contour, phone boundaries and playhead, drawn into a rect of a CG context (screenshots and exports).
+    func drawTimeline(in rect: NSRect, ctx: CGContext) {
+        guard timeline.frames > 0 else { return }
+        let frames = Double(timeline.frames)
+        func x(_ frame: Double) -> CGFloat { rect.minX + rect.width * frame / frames }
+
+        if showF0, !timeline.f0.isEmpty {
+            ctx.saveGState()
+            ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.9).cgColor)
+            ctx.setLineWidth(1.5); ctx.setLineJoin(.round)
+            var pen = false
+            for (t, hz) in timeline.f0.enumerated() {
+                guard let f = Timeline.melFraction(hz: hz) else { pen = false; continue }
+                let p = CGPoint(x: x(Double(t)), y: rect.minY + rect.height * f)   // CG origin is bottom-left
+                if pen { ctx.addLine(to: p) } else { ctx.move(to: p); pen = true }
+            }
+            ctx.strokePath()
+            ctx.restoreGState()
+        }
+        if showPhones, !timeline.phones.isEmpty {
+            ctx.saveGState()
+            ctx.setStrokeColor(NSColor.white.withAlphaComponent(0.25).cgColor)
+            ctx.setLineWidth(0.5)
+            for phone in timeline.phones {
+                ctx.move(to: CGPoint(x: x(Double(phone.start)), y: rect.minY))
+                ctx.addLine(to: CGPoint(x: x(Double(phone.start)), y: rect.maxY))
+            }
+            ctx.strokePath()
+            let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedSystemFont(ofSize: 9, weight: .medium), .foregroundColor: NSColor.white]
+            for phone in timeline.phones where phone.length > 2 {
+                let label = phone.symbol == " " ? "·" : phone.symbol
+                (label as NSString).draw(at: CGPoint(x: x(Double(phone.start)) + 1, y: rect.minY + 2), withAttributes: attrs)
+            }
+            ctx.restoreGState()
+        }
+        if playhead > 0 {
+            ctx.saveGState()
+            ctx.setStrokeColor(NSColor.systemOrange.cgColor); ctx.setLineWidth(1.5)
+            let px = x(min(playhead * 93.75, frames))
+            ctx.move(to: CGPoint(x: px, y: rect.minY)); ctx.addLine(to: CGPoint(x: px, y: rect.maxY))
+            ctx.strokePath()
+            ctx.restoreGState()
+        }
+    }
+
     /// PNG of the window: SwiftUI chrome via cacheDisplay, Metal/SceneKit regions rendered offscreen and composited.
     /// (Screen capture APIs need a TCC grant this machine denies; the app can always render its own content.)
     func screenshot() -> Data? {
@@ -263,6 +352,11 @@ extension AppModel {
                 NSImage(cgImage: snap, size: v.bounds.size).draw(in: v.convert(v.bounds, to: cv))
             }
             if let s = terrain, s.window === win, !s.isHidden { s.snapshot().draw(in: s.convert(s.bounds, to: cv)) }
+            // The SwiftUI overlay sits above the Metal view on screen, but the composite above just painted
+            // over it — so redraw the contour, phone boundaries and playhead with Core Graphics.
+            if let v = heatmap, v.window === win, !v.isHidden, let ctx = NSGraphicsContext.current?.cgContext {
+                drawTimeline(in: v.convert(v.bounds, to: cv), ctx: ctx)
+            }
             // SwiftUI text is not captured by cacheDisplay/CALayer.render on macOS 26: stamp the state as a caption.
             let st = stats, p = params
             let caption = String(format: "%@  ·  layer %@  ·  %d frames  ·  min %.2f max %.2f mean %.2f floor %.0f%%  ·  %@ %@\nexposure %.1f dB  contrast %.2f@%.1f  hi %.2f  sh %.2f  tilt %.1f/%.1f  floor %.0f dB  highCut %d  smooth %.2f  ·  %@",
