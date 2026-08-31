@@ -277,6 +277,8 @@ final class AppModel: ObservableObject {
 
     /// Set by the view so a canvas edit can update the text field.
     var onMarkupChanged: ((String) -> Void)? = nil
+    /// Set by the view: touching the picture takes focus out of the text field, so space plays again.
+    var onCanvasInteraction: (() -> Void)? = nil
 
     /// Normalized log-F0 (what the model predicts) -> Hz, using this speaker's statistics.
     func hzFromNormalized(_ values: [Float]) -> [Float] {
@@ -292,6 +294,7 @@ final class AppModel: ObservableObject {
 
     /// Drag one phone's pitch to `hz` (and blend it into `radius` neighbours so the line stays smooth).
     func setPitch(phone: Int, hz: Float, radius: Int = 1) {
+        onCanvasInteraction?()
         guard phone >= 0, phone < baseHz.count, baseHz[phone] > 0, hz > 20 else { return }
         let target = 12 * log2(hz / baseHz[phone])
         for r in -radius...radius {
@@ -305,6 +308,7 @@ final class AppModel: ObservableObject {
 
     /// Move the playhead by hand, and follow it with the audio when something is playing.
     func scrub(to seconds: Double) {
+        onCanvasInteraction?()
         playhead = max(0, seconds)
         if audio.playing || audio.looping { audio.seek(playhead, in: currentAudio) }
     }
@@ -402,6 +406,7 @@ final class AppModel: ObservableObject {
 
     private func setSource(_ mel: [Float], name: String, layer: String) {
         original = mel; frames = mel.count / 100; sourceName = name; self.layer = layer
+        playhead = 0
         audioOriginal = vocode(mel)
         if layer == "wav" { lastPhones = [] }
         recompute(immediately: true)
@@ -438,13 +443,23 @@ final class AppModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + (immediately ? 0 : (live ? 0.1 : 0.25)), execute: work)
     }
 
+    /// Play from the playhead (past the end, start over) — Play resumes, it does not rewind.
     func play(original: Bool? = nil) {
         let useOriginal = original ?? showOriginal
         let a = useOriginal ? audioOriginal : audioEdited
         guard !a.isEmpty else { return }
         if live { live = false }
-        audio.play(a)
+        let duration = Double(a.count) / 24000
+        let from = playhead < duration - 0.05 ? playhead : 0
+        playhead = from
+        audio.play(a, at: from)
         status = useOriginal ? "playing original" : "playing edited"
+    }
+
+    /// Space bar: pause where we are, or resume from there.
+    func togglePlay() {
+        if audio.playing || audio.looping { audio.stop(); status = String(format: "paused at %.2f s", playhead) }
+        else { play() }
     }
 
     func export(to dir: String) throws -> [String] {

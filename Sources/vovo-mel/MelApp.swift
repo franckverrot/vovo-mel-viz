@@ -38,6 +38,8 @@ struct EditorView: View {
     @State private var guidance: Float = 2
     @State private var steps = 16
     @State private var breakMs = 300
+    /// The text field is the only thing that should ever eat the space bar.
+    @FocusState private var typing: Bool
 
     /// Drives the playhead while audio is playing; idle otherwise.
     private let tick = Timer.publish(every: 1.0 / 30, on: .main, in: .common).autoconnect()
@@ -77,14 +79,22 @@ struct EditorView: View {
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 13))
                     .lineLimit(2...5)
-                    .onSubmit { say() }
+                    .focused($typing)
+                    .onSubmit { say(); typing = false }
+                    .overlay(alignment: .trailingFirstTextBaseline) {
+                        if typing { Text("esc to leave the field — space then plays").font(.caption2).foregroundStyle(.secondary).padding(.trailing, 8) }
+                    }
                 synthBar
             }
             .padding(12)
             .frame(minWidth: 700)
             controls.frame(width: 320)
         }
-        .onAppear { model.onMarkupChanged = { sayText = $0 } }
+        .onAppear {
+            model.onMarkupChanged = { sayText = $0 }
+            model.onCanvasInteraction = { typing = false }
+        }
+        .onExitCommand { typing = false }
         .onReceive(tick) { _ in
             // Follow the audio while it plays; leave a hand-placed playhead alone when it stops.
             guard model.audio.playing || model.audio.looping else { return }
@@ -115,7 +125,12 @@ struct EditorView: View {
     var transport: some View {
         HStack(spacing: 12) {
             Picker("", selection: $model.showOriginal) { Text("Edited").tag(false); Text("Original").tag(true) }.pickerStyle(.segmented).frame(width: 180)
-            Button(model.audio.playing ? "■ Stop" : "▶ Play") { model.audio.playing ? model.audio.stop() : model.play() }.keyboardShortcut(.space, modifiers: [])
+            Button(model.audio.playing ? "❚❚ Pause" : "▶ Play") { model.togglePlay() }
+                .help("Play from the playhead, or pause there (space)")
+            Button("") { model.togglePlay() }
+                .keyboardShortcut(.space, modifiers: [])
+                .disabled(typing)
+                .frame(width: 0, height: 0).opacity(0).accessibilityHidden(true)
             Button("A/B") { model.showOriginal.toggle(); if !model.live { model.play() } }.keyboardShortcut("b")
             Toggle("Live", isOn: $model.live).toggleStyle(.switch).keyboardShortcut("l").help("Loop the utterance and hear every slider move mid-sentence (L)")
             Picker("Vocoder", selection: Binding(get: { model.vocoderName == "vocos" ? model.vocoderPath : "griffinlim" },

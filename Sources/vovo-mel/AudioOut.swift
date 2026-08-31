@@ -63,14 +63,18 @@ final class AudioOut {
         try? engine.start()
     }
 
-    func play(_ samples: [Float]) {
+    /// Play `samples` from `at` seconds (the playhead), so Play resumes instead of restarting.
+    func play(_ samples: [Float], at offset: Double = 0) {
         stop()
+        let from = min(max(0, Int(offset * 24000)), max(samples.count - 1, 0))
+        let samples = from > 0 ? Array(samples[from...]) : samples
+        let startedAt = Double(from) / 24000
         guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)) else { return }
         buf.frameLength = AVAudioFrameCount(samples.count)
         samples.withUnsafeBufferPointer { buf.floatChannelData![0].update(from: $0.baseAddress!, count: samples.count) }
         if !engine.isRunning { try? engine.start() }
         playing = true
-        oneShotStart = Date(); oneShotSeconds = Double(samples.count) / 24000
+        oneShotStart = Date().addingTimeInterval(-startedAt); oneShotSeconds = startedAt + Double(samples.count) / 24000
         player.scheduleBuffer(buf, at: nil, options: []) { [weak self] in DispatchQueue.main.async { self?.playing = false; self?.oneShotStart = nil } }
         player.play()
     }
@@ -87,10 +91,7 @@ final class AudioOut {
             return
         }
         guard playing else { return }
-        let from = min(max(0, Int(seconds * 24000)), samples.count)
-        play(Array(samples[from...]))
-        oneShotStart = Date().addingTimeInterval(-seconds)
-        oneShotSeconds = Double(samples.count) / 24000
+        play(samples, at: seconds)
     }
 
     /// Start looping `samples` from the beginning (stops one-shot playback).
