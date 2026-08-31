@@ -18,6 +18,8 @@ import VovoData
 ///   POST /view     {"showOriginal":bool,"terrain3D":bool,"live":bool}   (live = loop the utterance, hot-swap on every edit)
 ///   GET  /pitch              -> per-phone base/edited F0 in Hz, the hand-drawn deltas, and the phone spans
 ///   POST /pitch    {"phone":N,"hz":180,"radius":1} | {"reset":true} | {"scrub":seconds} | {"editing":bool}
+///                  | {"break":300} | {"emphasis":"strong|moderate|reduced|none"} | {"commit":true}
+///                  (structural edits apply at the playhead and rewrite the text as SSML)
 ///   POST /export   {"dir":"path"} -> {"written":[…]}
 final class LocalServer {
     let model: AppModel
@@ -153,6 +155,9 @@ final class LocalServer {
                 }
                 if let t = (b["scrub"] as? NSNumber)?.doubleValue { model.scrub(to: t) }
                 if let e = b["editing"] as? Bool { model.editingPitch = e }
+                if let ms = (b["break"] as? NSNumber)?.intValue { model.insertBreak(milliseconds: ms) }
+                if let level = b["emphasis"] as? String { model.setEmphasis(level == "none" ? nil : level) }
+                if b["commit"] as? Bool == true { model.commitToMarkup() }
                 return ("200 OK", "application/json", try JSONEncoder().encode(model.state))
             case ("GET", "/pitch"):
                 return ("200 OK", "application/json", json(["baseHz": model.baseHz.map(Double.init),

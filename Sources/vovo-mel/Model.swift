@@ -38,6 +38,16 @@ final class AppModel: ObservableObject {
     @Published var editingPitch = false
     /// Per-phone F0 in Hz as predicted before any hand editing (the curve you drag away from).
     @Published var baseHz: [Float] = []
+    /// The words the phones came from (normalized), the word each phone belongs to, and the structural
+    /// edits made on the canvas — together these regenerate the markup shown in the text field.
+    @Published var words: [String] = []
+    @Published var breaks: [Int: Int] = [:]        // word index -> milliseconds of pause after it
+    @Published var emphasis: [Int: String] = [:]   // word index -> strong | moderate | reduced
+    @Published var markup = ""                     // the SSML the canvas edits describe
+    var wordOfPhone: [Int] = []
+    /// Pitch already written into the markup, per word. Live drags add to this; together they are what the
+    /// text says, which is why a second edit does not erase the first.
+    var committedPitch: [Int: Float] = [:]
     @Published var pitchShift: Float = 0
     @Published var pitchScale: Float = 1
     @Published var energyShift: Float = 0
@@ -171,6 +181,103 @@ final class AppModel: ObservableObject {
 
     struct NoWeights: LocalizedError { var errorDescription: String? { "no acoustic checkpoint — Download the published voice (\(HubWeights.approxMB) MB) or choose a safetensors file" } }
 
+    /// Which word each phone belongs to (a word = a run of phones between spaces and punctuation), so a
+    /// drag on the canvas can be written back as markup around the word it touched.
+    func buildWordMap(phones: [Int32], text: String) {
+        let space = Int32(PhoneSet.idOf[" "] ?? 4)
+        let punctuation = Set([",", ".", "?", "!", ";", ":", "—", "…"].map { Int32(PhoneSet.idOf[$0] ?? -1) })
+        var map = [Int](repeating: -1, count: phones.count)
+        var word = -1, inWord = false
+        for (i, p) in phones.enumerated() {
+            if p == space || punctuation.contains(p) { inWord = false; continue }
+            if !inWord { word += 1; inWord = true }
+            map[i] = word
+        }
+        wordOfPhone = map
+        // The spoken words are the normalized ones — that is what the phones were made from.
+        let plain = SSML.looksLikeMarkup(text)
+            ? ((try? VovoTTS.plan(ssml: text, g2p: G2P()).spans) ?? []).compactMap { if case .text(let t, _) = $0 { return t } else { return nil } }.joined(separator: " ")
+            : text
+        words = Normalizer.normalize(plain).split(separator: " ").map(String.init)
+        if words.count < word + 1 { words += (words.count...(word)).map { _ in "…" } }
+        breaks = [:]; emphasis = [:]; committedPitch = [:]
+        markup = ""
+    }
+
+    /// Mean hand-drawn shift of a word, in semitones.
+    func wordPitch(_ index: Int) -> Float { (committedPitch[index] ?? 0) + liveWordPitch(index) }
+
+    /// The part of a word's shift that has been dragged but not yet written into the markup.
+    func liveWordPitch(_ index: Int) -> Float {
+        let deltas = wordOfPhone.enumerated().filter { $0.element == index && $0.offset < pitchDelta.count }.map { pitchDelta[$0.offset] }
+        guard !deltas.isEmpty else { return 0 }
+        return deltas.reduce(0, +) / Float(deltas.count)
+    }
+
+    /// The markup that describes what is on the canvas: a `<prosody>` per moved word, `<emphasis>` where
+    /// asked, `<break/>` where inserted. This is what you would have typed to get the same result.
+    func ssmlFromCanvas() -> String {
+        guard !words.isEmpty else { return "" }
+        var out: [String] = []
+        for (i, w) in words.enumerated() {
+            var piece = w
+            if let level = emphasis[i] { piece = "<emphasis level=\"\(level)\">\(piece)</emphasis>" }
+            let st = wordPitch(i)
+            if abs(st) >= 0.25 { piece = "<prosody pitch=\"\(String(format: "%+.1f", st))st\">\(piece)</prosody>" }
+            out.append(piece)
+            if let ms = breaks[i] { out.append("<break time=\"\(ms)ms\"/>") }
+        }
+        return "<speak>" + out.joined(separator: " ").replacingOccurrences(of: " <break", with: "<break") + "</speak>"
+    }
+
+    /// Word under the playhead, from the phone spans.
+    var wordAtPlayhead: Int? {
+        let frame = Int(playhead * 93.75)
+        guard let phone = timeline.phones.firstIndex(where: { frame >= $0.start && frame < $0.start + $0.length }),
+              phone < wordOfPhone.count else { return nil }
+        let w = wordOfPhone[phone]
+        if w >= 0 { return w }
+        // On a space or a pause: attach to the previous word.
+        return wordOfPhone[..<phone].last(where: { $0 >= 0 })
+    }
+
+    /// Insert a pause after the word under the playhead and rebuild from the markup.
+    func insertBreak(milliseconds: Int = 300) {
+        guard let w = wordAtPlayhead else { status = "put the playhead on a word first"; return }
+        breaks[w] = milliseconds
+        commitToMarkup(note: "break \(milliseconds) ms after “\(words[w])”")
+    }
+
+    func setEmphasis(_ level: String?) {
+        guard let w = wordAtPlayhead else { status = "put the playhead on a word first"; return }
+        if let level { emphasis[w] = level } else { emphasis.removeValue(forKey: w) }
+        commitToMarkup(note: level.map { "\($0) emphasis on “\(words[w])”" } ?? "emphasis cleared")
+    }
+
+    /// Write the canvas edits into the text field as markup and re-synthesize from it, so the text is
+    /// always the document — what you drew is what you could have typed.
+    func commitToMarkup(note: String? = nil) {
+        let text = ssmlFromCanvas()
+        guard !text.isEmpty else { return }
+        // Fold the live drags into what the markup already says, and keep the structural edits: synthesizing
+        // rebuilds the word map from scratch, and without this a second edit would erase the first.
+        var pitch = committedPitch
+        for i in words.indices { let v = wordPitch(i); if abs(v) >= 0.05 { pitch[i] = v } }
+        let savedBreaks = breaks, savedEmphasis = emphasis, savedWords = words
+        markup = text
+        onMarkupChanged?(text)
+        do {
+            try synthesize(text: text, guidance: lastSay?.guidance ?? 2, steps: lastSay?.steps ?? 16)
+            committedPitch = pitch; breaks = savedBreaks; emphasis = savedEmphasis
+            if words.count != savedWords.count { words = savedWords }   // the markup adds tags, not words
+            markup = text
+            status = note ?? "written into the text field"
+        } catch { status = "\(error)" }
+    }
+
+    /// Set by the view so a canvas edit can update the text field.
+    var onMarkupChanged: ((String) -> Void)? = nil
+
     /// Normalized log-F0 (what the model predicts) -> Hz, using this speaker's statistics.
     func hzFromNormalized(_ values: [Float]) -> [Float] {
         guard let cfg = model?.model.cfg, !cfg.f0Mean.isEmpty else { return values.map { _ in 0 } }
@@ -280,6 +387,7 @@ final class AppModel: ObservableObject {
         pitchDelta = [Float](repeating: 0, count: s.pitch.count)
         baseHz = hzFromNormalized(s.pitch)
         lastPlan = plan?.control
+        buildWordMap(phones: ids, text: text)
         synthesis = s
         lastSay = (text, guidance, steps)
         setSource(s.mel, name: "\"\(text.prefix(40))\" (\(URL(fileURLWithPath: path).lastPathComponent), g\(guidance), \(steps) steps)", layer: "decoder")
@@ -356,7 +464,7 @@ final class AppModel: ObservableObject {
     struct State: Codable {
         var source: String, layer: String, frames: Int, params: EditParams, vocoder: String, vocoderPath: String, showOriginal: Bool, terrain3D: Bool, live: Bool
         var stats: MelEdit.Stats, playing: Bool, lastRenderMs: Double, status: String, checkpoint: String
-        var phones: String, voicedFraction: Double, medianF0: Double, playhead: Double
+        var phones: String, markup: String, voicedFraction: Double, medianF0: Double, playhead: Double
         var pitchShift: Float, pitchScale: Float, energyShift: Float
         var weights: Weights
         struct Weights: Codable { var installed: Bool, directory: String, repo: String, hasAcoustic: Bool, hasVocos: Bool, downloading: Double?, message: String }
@@ -365,7 +473,7 @@ final class AppModel: ObservableObject {
         State(source: sourceName, layer: layer, frames: frames, params: params, vocoder: vocoderName, vocoderPath: vocoderName == "vocos" ? vocoderPath : "griffinlim",
               showOriginal: showOriginal, terrain3D: terrain3D, live: live,
               stats: stats, playing: audio.playing || audio.looping, lastRenderMs: lastRenderMs, status: status, checkpoint: checkpointPath,
-              phones: lastPhones.joined(), voicedFraction: timeline.f0.isEmpty ? 0 : Double(timeline.f0.filter { $0 > 0 }.count) / Double(timeline.f0.count),
+              phones: lastPhones.joined(), markup: markup, voicedFraction: timeline.f0.isEmpty ? 0 : Double(timeline.f0.filter { $0 > 0 }.count) / Double(timeline.f0.count),
               medianF0: {
                   let v = timeline.f0.filter { $0 > 0 }.sorted()
                   return v.isEmpty ? 0 : Double(v[v.count / 2])

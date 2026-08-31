@@ -12,8 +12,13 @@ struct MelHeatmap: NSViewRepresentable {
 
     func makeCoordinator() -> Renderer { Renderer() }
 
+    /// Transparent to hit-testing: the SwiftUI overlays above it own the mouse (scrub, pitch drag).
+    final class PassthroughMTKView: MTKView {
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
+
     func makeNSView(context: Context) -> MTKView {
-        let v = MTKView(frame: .zero, device: context.coordinator.device)
+        let v = PassthroughMTKView(frame: .zero, device: context.coordinator.device)
         v.colorPixelFormat = .bgra8Unorm
         v.delegate = context.coordinator
         v.enableSetNeedsDisplay = true

@@ -37,6 +37,7 @@ struct EditorView: View {
     @State private var sayText = "The quick brown fox jumps over the lazy dog."
     @State private var guidance: Float = 2
     @State private var steps = 16
+    @State private var breakMs = 300
 
     /// Drives the playhead while audio is playing; idle otherwise.
     private let tick = Timer.publish(every: 1.0 / 30, on: .main, in: .common).autoconnect()
@@ -70,6 +71,7 @@ struct EditorView: View {
                     return true
                 }
                 transport
+                editBar
                 TextField("Text to synthesize — plain text or SSML (<prosody>, <emphasis>, <break/>)", text: $sayText, axis: .vertical)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 13))
@@ -81,6 +83,7 @@ struct EditorView: View {
             .frame(minWidth: 700)
             controls.frame(width: 320)
         }
+        .onAppear { model.onMarkupChanged = { sayText = $0 } }
         .onReceive(tick) { _ in
             // Follow the audio while it plays; leave a hand-placed playhead alone when it stops.
             guard model.audio.playing || model.audio.looping else { return }
@@ -177,6 +180,28 @@ struct EditorView: View {
         .padding(10)
         .background(Color.accentColor.opacity(0.12))
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    /// Structural edits at the playhead — the video-editor gestures: cut in a pause, stress a word.
+    var editBar: some View {
+        HStack(spacing: 10) {
+            Text(model.wordAtPlayhead.map { "at “\(model.words.indices.contains($0) ? model.words[$0] : "?")”" } ?? "move the playhead onto a word")
+                .font(.caption).foregroundStyle(.secondary).frame(width: 150, alignment: .leading)
+            Button("⏸ Break") { model.insertBreak(milliseconds: breakMs) }
+                .disabled(model.wordAtPlayhead == nil)
+                .help("Insert a pause after the word under the playhead")
+            Stepper("\(breakMs) ms", value: $breakMs, in: 50...1500, step: 50).frame(width: 110)
+            Divider().frame(height: 16)
+            Button("Emphasize") { model.setEmphasis("strong") }.disabled(model.wordAtPlayhead == nil)
+            Button("Soften") { model.setEmphasis("reduced") }.disabled(model.wordAtPlayhead == nil)
+            Button("Clear") { model.setEmphasis(nil) }.disabled(model.wordAtPlayhead == nil)
+            Divider().frame(height: 16)
+            Button("Write markup") { model.commitToMarkup() }
+                .help("Write what you drew into the text field as SSML")
+                .disabled(model.words.isEmpty)
+            Spacer()
+        }
+        .font(.callout)
     }
 
     func say() {
