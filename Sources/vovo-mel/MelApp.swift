@@ -47,6 +47,7 @@ struct EditorView: View {
             VStack(spacing: 8) {
                 if !model.hasAcoustic || !model.hasVocos || model.downloadProgress != nil { weightsBanner }
                 header
+                if model.frames > 0 && !model.terrain3D { TimeRuler() }
                 ZStack {
                     if model.frames == 0 {
                         Text("Drop a WAV, open one (⌘O), or synthesize below").foregroundStyle(.secondary)

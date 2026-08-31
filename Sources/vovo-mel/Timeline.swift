@@ -160,3 +160,73 @@ extension Timeline {
         return Float(700 * (pow(10, m / 2595) - 1))
     }
 }
+
+/// A downward-pointing playhead handle.
+struct PlayheadHandle: Shape {
+    func path(in r: CGRect) -> Path {
+        var p = Path()
+        p.move(to: CGPoint(x: r.minX, y: r.minY))
+        p.addLine(to: CGPoint(x: r.maxX, y: r.minY))
+        p.addLine(to: CGPoint(x: r.midX, y: r.maxY))
+        p.closeSubpath()
+        return p
+    }
+}
+
+/// The time ruler above the spectrogram: ticks, seconds, and a handle you can grab and drag. Scrubbing
+/// lives here so it stays available while the spectrogram itself is in pitch-editing mode.
+struct TimeRuler: View {
+    @EnvironmentObject var model: AppModel
+    let frameRate: Double = 93.75
+    private let height: CGFloat = 24
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let seconds = max(Double(model.frames) / frameRate, 0.001)
+            let x = w * min(max(model.playhead / seconds, 0), 1)
+            // A tick every 0.1 s, a labelled one every 0.5 s — denser than that is unreadable at this size.
+            let step = 0.1, labelEvery = 5
+
+            ZStack(alignment: .topLeading) {
+                RoundedRectangle(cornerRadius: 4).fill(Color.black.opacity(0.22))
+                Path { p in
+                    var i = 0
+                    var t = 0.0
+                    while t <= seconds {
+                        let tx = w * t / seconds
+                        let long = i % labelEvery == 0
+                        p.move(to: CGPoint(x: tx, y: long ? height - 11 : height - 6))
+                        p.addLine(to: CGPoint(x: tx, y: height))
+                        t += step; i += 1
+                    }
+                }
+                .stroke(Color.secondary.opacity(0.55), lineWidth: 0.75)
+
+                ForEach(0...Int(seconds / (step * Double(labelEvery))), id: \.self) { k in
+                    let t = Double(k) * step * Double(labelEvery)
+                    Text(String(format: "%.1f", t))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .position(x: w * t / seconds + 12, y: 7)
+                }
+
+                PlayheadHandle()
+                    .fill(Color.orange)
+                    .frame(width: 13, height: 9)
+                    .position(x: x, y: height - 5)
+                    .shadow(color: .black.opacity(0.4), radius: 1)
+                Text(String(format: "%.2f s", model.playhead))
+                    .font(.system(size: 9, design: .monospaced).bold())
+                    .foregroundStyle(Color.orange)
+                    .position(x: min(max(x + 26, 26), w - 26), y: 7)
+            }
+            .frame(height: height)
+            .contentShape(Rectangle())
+            .gesture(DragGesture(minimumDistance: 0).onChanged { g in
+                model.scrub(to: seconds * min(max(g.location.x / w, 0), 1))
+            })
+        }
+        .frame(height: height)
+    }
+}
